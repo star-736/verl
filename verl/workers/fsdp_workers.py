@@ -700,10 +700,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         set_expandable_segments(False)
 
+        first_time_sync = not self.base_sync_done
+        device = get_device_id()  # used for pushing weights to rollout
+
         if peft_config is not None and self.base_sync_done:
             per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
         else:
-            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
             per_tensor_param = (
                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
                 for name, param in params.items()
@@ -723,6 +725,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
         log_gpu_memory_usage("After update_weights", logger=logger)
+
+        # If rollout starts from dummy weights with LoRA, push adapter weights once right after the base sync.
+        if peft_config is not None and first_time_sync:
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            lora_params = collect_lora_params(
+                module=self.actor_module_fsdp,
+                layered_summon=self.config.rollout.get("layered_summon", False),
+                base_sync_done=True,
+            )
+            lora_params = convert_weight_keys(
+                lora_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            )
+            per_tensor_lora_params = [
+                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                for name, param in lora_params.items()
+            ]
+            await self.rollout.update_weights(
+                per_tensor_lora_params, peft_config=peft_config, base_sync_done=True
+            )
+            log_gpu_memory_usage("After update_lora_weights", logger=logger)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
         del params, per_tensor_param
         aggressive_empty_cache(force_sync=True)
         if self.config.rollout.free_cache_engine:
